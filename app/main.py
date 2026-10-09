@@ -593,6 +593,227 @@ def build_department_summary_pipeline(
     ]
 
 
+def build_late_leaderboard_pipeline(
+    start_date: str,
+    end_date: str,
+    limit: int = 10,
+    department: Optional[str] = None,
+) -> list:
+    """Build late leaderboard aggregation pipeline with standard competition ranking."""
+    pipeline: list = [
+        {
+            "$match": {
+                "date": {"$gte": start_date, "$lte": end_date},
+                "late_minutes": {"$gt": 0},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "emp",
+            }
+        },
+        {"$unwind": "$emp"},
+    ]
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.extend([
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {"$rank": {}}
+                },
+            }
+        },
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {
+            "$project": {
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": "$emp.name",
+                "department": "$emp.department",
+                "total_late_minutes": 1,
+                "late_count": 1,
+                "_id": 0,
+            }
+        },
+    ])
+    return pipeline
+
+
+def build_department_trend_pipeline(
+    department: str,
+    from_str: str,
+    num_days: int,
+    emp_codes: List[str],
+    joined_ons: List[str],
+) -> list:
+    """
+    Build aggregation pipeline generating daily series with in-pipeline gap filling,
+    roster filtering, rate calculation, and a 7-day moving average.
+    """
+    return [
+        {"$match": {"department": department}},
+        {"$limit": 1},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "emp_code": {"$in": emp_codes},
+                            "date": {
+                                "$gte": from_str,
+                                "$lte": (date.fromisoformat(from_str) + timedelta(days=num_days - 1)).isoformat(),
+                            },
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$date",
+                            "present2": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                                        {"$cond": [{"$ifNull": ["$half_day", False]}, 1, 2]},
+                                        0,
+                                    ]
+                                }
+                            },
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]
+                                }
+                            },
+                        }
+                    },
+                ],
+                "as": "day_stats",
+            }
+        },
+        {
+            "$project": {
+                "days": {
+                    "$map": {
+                        "input": {"$range": [0, num_days]},
+                        "as": "i",
+                        "in": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d",
+                                "date": {
+                                    "$dateAdd": {
+                                        "startDate": {"$dateFromString": {"dateString": from_str}},
+                                        "unit": "day",
+                                        "amount": "$$i",
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+                "day_stats": 1,
+            }
+        },
+        {"$unwind": "$days"},
+        {
+            "$project": {
+                "date": "$days",
+                "stat": {
+                    "$first": {
+                        "$filter": {
+                            "input": "$day_stats",
+                            "as": "s",
+                            "cond": {"$eq": ["$$s._id", "$days"]},
+                        }
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "date": 1,
+                "is_working_day": {
+                    "$in": [
+                        {"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}},
+                        [1, 2, 3, 4, 5],
+                    ]
+                },
+                "present_count": {"$divide": [{"$ifNull": ["$stat.present2", 0]}, 2]},
+                "present2": {"$ifNull": ["$stat.present2", 0]},
+                "late_count": {"$ifNull": ["$stat.late_count", 0]},
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": joined_ons,
+                            "as": "j",
+                            "cond": {"$lte": ["$$j", "$date"]},
+                        }
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                {"$eq": ["$is_working_day", True]},
+                                {"$gt": ["$headcount", 0]},
+                            ]
+                        },
+                        {
+                            "$divide": [
+                                {
+                                    "$floor": {
+                                        "$divide": [
+                                            {"$add": [{"$multiply": ["$present2", 10000]}, "$headcount"]},
+                                            {"$multiply": [2, "$headcount"]},
+                                        ]
+                                    }
+                                },
+                                10000,
+                            ]
+                        },
+                        None,
+                    ]
+                },
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"date": 1},
+                "output": {
+                    "raw_moving_avg": {
+                        "$avg": "$attendance_rate",
+                        "window": {
+                            "documents": [-6, 0]
+                        },
+                    }
+                },
+            }
+        },
+        {"$sort": {"date": 1}},
+    ]
+
+
 
 # --------------------------------------------------------------------------- #
 # 7. Lifespan & Index Creation
@@ -1039,6 +1260,74 @@ def department_summary(
 
     return {
         "month": month,
+        "items": items,
+    }
+
+
+@app.get("/analytics/leaderboard/late", tags=["analytics"])
+def late_leaderboard(
+    month: str = Query(...),
+    limit: int = Query(default=10, ge=1, le=50),
+    department: Optional[str] = Query(None),
+):
+    """Late-comers leaderboard for a month using $setWindowFields and $rank."""
+    y, m = parse_month_strict(month, ("query", "month"))
+    _, last_day = calendar.monthrange(y, m)
+    start_date = f"{y:04d}-{m:02d}-01"
+    end_date = f"{y:04d}-{m:02d}-{last_day:02d}"
+
+    pipeline = build_late_leaderboard_pipeline(start_date, end_date, limit, department)
+    items = list(db.attendance_logs.aggregate(pipeline))
+
+    return {
+        "month": month,
+        "items": items,
+    }
+
+
+@app.get("/analytics/departments/{department}/trend", tags=["analytics"])
+def department_trend(
+    department: str,
+    from_str: str = Query(..., alias="from"),
+    to_str: str = Query(..., alias="to"),
+):
+    """Daily attendance trend with database-side gap filling and 7-day moving average."""
+    from_d = parse_date_strict(from_str, ("query", "from"))
+    to_d = parse_date_strict(to_str, ("query", "to"))
+
+    if to_d < from_d:
+        raise unprocessable(("query", "to"), "to cannot be earlier than from")
+
+    num_days = (to_d - from_d).days + 1
+    if num_days > MAX_TREND_DAYS:
+        raise unprocessable(("query", "to"), "range exceeds 92 calendar days")
+
+    roster = list(db.employees.find({"department": department}, {"emp_code": 1, "joined_on": 1, "_id": 0}))
+    if not roster:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="department not found")
+
+    emp_codes = [e["emp_code"] for e in roster]
+    joined_ons = [e["joined_on"] for e in roster]
+
+    pipeline = build_department_trend_pipeline(department, from_str, num_days, emp_codes, joined_ons)
+    rows = list(db.employees.aggregate(pipeline))
+
+    items = []
+    for r in rows:
+        att_rate = r8(r.get("attendance_rate"), 4)
+        m_avg = r8(r.get("raw_moving_avg"), 4)
+        items.append({
+            "date": r["date"],
+            "is_working_day": bool(r["is_working_day"]),
+            "headcount": int(r["headcount"]),
+            "present_count": float(r["present_count"]),
+            "late_count": int(r["late_count"]),
+            "attendance_rate": att_rate,
+            "moving_avg_7d": m_avg,
+        })
+
+    return {
+        "department": department,
         "items": items,
     }
 
