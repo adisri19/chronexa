@@ -965,6 +965,12 @@ def punch_out(body: PunchOutRequest):
         sort=[("punch_in", -1)],
     )
     if not rec:
+        any_rec = db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$ne": None}},
+            sort=[("punch_in", -1)],
+        )
+        if any_rec and out_dt <= any_rec["punch_in"]:
+            raise unprocessable(("body", "punched_at"), "punched_at must be strictly greater than punch_in")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no punch-in found")
 
     # Ambiguity A1: if already closed, return 409 directly (do not fall back to older record)
