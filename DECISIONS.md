@@ -1,4 +1,4 @@
-# DECISIONS.md (about 150-200 words in total - plain language, your own words)
+# Chronexa Architectural Decisions
 
 1. **Indexes.** I created unique indexes on `employees.emp_code` and `attendance_logs.(emp_code, date)` to guarantee entity uniqueness and race-free writes. For querying, I indexed `(date, emp_code)`, `(status, date, emp_code)`, and `(emp_code, punch_in)` on logs, plus `(department, joined_on)` on employees. I considered and rejected denormalizing department into attendance logs because department belongs to the employee profile and would introduce stale data.
 
