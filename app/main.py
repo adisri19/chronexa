@@ -377,3 +377,54 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+
+# --------------------------------------------------------------------------- #
+# 9. Employee Endpoints
+# --------------------------------------------------------------------------- #
+@app.post("/employees", status_code=status.HTTP_201_CREATED, tags=["employees"])
+def create_employee(body: EmployeeCreate):
+    """Create an employee; enforces uniqueness via unique index, returning 409 on duplicate."""
+    created_dt = now_dt()
+    doc = {
+        "emp_code": body.emp_code,
+        "name": body.name,
+        "email": body.email,
+        "department": body.department,
+        "shift_start": body.shift_start,
+        "shift_end": body.shift_end,
+        "joined_on": body.joined_on,
+        "created_at": created_dt,
+    }
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="emp_code already exists")
+
+    return serialize_employee(doc)
+
+
+@app.get("/employees", tags=["employees"])
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List employees paginated and sorted by emp_code ascending."""
+    q: dict = {}
+    if department is not None:
+        q["department"] = department
+
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    cursor = db.employees.find(q, {"_id": 0}).sort([("emp_code", 1)]).skip(skip).limit(page_size)
+    items = [serialize_employee(emp) for emp in cursor]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
