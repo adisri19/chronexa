@@ -1,0 +1,61 @@
+{
+  "timestamp": "2026-10-09T15:13:56.030946+00:00",
+  "hardware": {
+    "node": "Adityas-MacBook-Air.local",
+    "system": "Darwin",
+    "machine": "arm64",
+    "python": "3.14.6"
+  },
+  "dataset": {
+    "employees": 500,
+    "attendance_logs": 100000
+  },
+  "explain_checks": {
+    "attendance_list": {
+      "IXSCAN": true,
+      "COLLSCAN": false
+    },
+    "employee_monthly": {
+      "IXSCAN": true,
+      "COLLSCAN": false
+    },
+    "department_summary": {
+      "IXSCAN": true,
+      "COLLSCAN": false
+    },
+    "late_leaderboard": {
+      "IXSCAN": true,
+      "COLLSCAN": false
+    },
+    "department_trend": {
+      "IXSCAN": true,
+      "COLLSCAN": false
+    }
+  },
+  "latencies": {
+    "GET /attendance (unfiltered)": {
+      "p50_ms": 21.78,
+      "p95_ms": 24.06
+    },
+    "GET /attendance (filtered)": {
+      "p50_ms": 4.59,
+      "p95_ms": 6.25
+    },
+    "GET /analytics/employees/{emp}/monthly": {
+      "p50_ms": 0.97,
+      "p95_ms": 1.35
+    },
+    "GET /analytics/departments/summary": {
+      "p50_ms": 37.44,
+      "p95_ms": 42.74
+    },
+    "GET /analytics/leaderboard/late": {
+      "p50_ms": 23.37,
+      "p95_ms": 25.75
+    },
+    "GET /analytics/departments/{dept}/trend": {
+      "p50_ms": 3.63,
+      "p95_ms": 6.08
+    }
+  }
+}
