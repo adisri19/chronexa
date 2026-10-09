@@ -72,3 +72,172 @@ client = MongoClient(
 db = client[MONGO_DB]
 
 
+# --------------------------------------------------------------------------- #
+# 3. Pure Helpers
+# --------------------------------------------------------------------------- #
+def unprocessable(loc: tuple, msg: str) -> RequestValidationError:
+    """Construct a FastAPI-standard RequestValidationError matching openapi detail array shape."""
+    return RequestValidationError([{"loc": list(loc), "msg": msg, "type": "value_error"}])
+
+
+def ms_to_dt(ms: int) -> datetime:
+    """Convert integer epoch milliseconds to UTC datetime truncated to whole seconds (R1)."""
+    s = (ms - ms % 1000) // 1000
+    return EPOCH_UTC + timedelta(seconds=s)
+
+
+def dt_to_ms(dt: datetime) -> int:
+    """Convert a datetime to exact integer epoch milliseconds."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int((dt - EPOCH_UTC) // timedelta(milliseconds=1))
+
+
+def now_dt() -> datetime:
+    """Current UTC datetime truncated to whole seconds."""
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse_hhmm(s: str) -> tuple[int, int]:
+    """Parse HH:MM string to (hour, minute)."""
+    h, m = map(int, s.split(":"))
+    return h, m
+
+
+def is_overnight(start: str, end: str) -> bool:
+    """Check if shift spans overnight: shift_end <= shift_start (R1)."""
+    return end <= start
+
+
+def shift_bounds(date_str: str, shift_start: str, shift_end: str) -> tuple[datetime, datetime]:
+    """Compute IST start and end datetimes for a shift given its attendance date (R1, R2, R3)."""
+    d = date.fromisoformat(date_str)
+    sh, sm = parse_hhmm(shift_start)
+    eh, em = parse_hhmm(shift_end)
+    start_dt = datetime(d.year, d.month, d.day, sh, sm, 0, tzinfo=IST)
+    if is_overnight(shift_start, shift_end):
+        end_d = d + timedelta(days=1)
+    else:
+        end_d = d
+    end_dt = datetime(end_d.year, end_d.month, end_d.day, eh, em, 0, tzinfo=IST)
+    return start_dt, end_dt
+
+
+def attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
+    """
+    Compute attendance date YYYY-MM-DD per Rule R1.
+    For overnight shifts, a punch-in strictly earlier than shift_end belongs to the previous day.
+    """
+    punch_in_ist = punch_in_utc.astimezone(IST)
+    cal_date = punch_in_ist.date()
+    if is_overnight(shift_start, shift_end):
+        eh, em = parse_hhmm(shift_end)
+        punch_tod = (punch_in_ist.hour, punch_in_ist.minute, punch_in_ist.second)
+        shift_end_tod = (eh, em, 0)
+        if punch_tod < shift_end_tod:
+            cal_date = cal_date - timedelta(days=1)
+    return cal_date.isoformat()
+
+
+def late_minutes_for(punch_in_utc: datetime, date_str: str, shift_start: str, shift_end: str) -> int:
+    """Compute late minutes per Rule R2: grace period 600s; floor(seconds / 60) since shift_start."""
+    start_dt, _ = shift_bounds(date_str, shift_start, shift_end)
+    punch_in_ist = punch_in_utc.astimezone(IST)
+    diff_sec = int((punch_in_ist - start_dt).total_seconds())
+    if diff_sec > GRACE_SECONDS:
+        return diff_sec // 60
+    return 0
+
+
+def overtime_for(punch_out_utc: datetime, date_str: str, shift_start: str, shift_end: str) -> int:
+    """Compute overtime minutes per Rule R3: >= 30 minutes after shift_end, else 0."""
+    _, end_dt = shift_bounds(date_str, shift_start, shift_end)
+    punch_out_ist = punch_out_utc.astimezone(IST)
+    diff_sec = int((punch_out_ist - end_dt).total_seconds())
+    mins = diff_sec // 60
+    if mins >= OVERTIME_MIN_MINUTES:
+        return mins
+    return 0
+
+
+def work_hours_for(punch_in_utc: datetime, punch_out_utc: datetime) -> float:
+    """Compute work hours per Rule R4: (out - in) seconds / 3600, rounded half-up to 2 dp."""
+    diff_sec = int((punch_out_utc - punch_in_utc).total_seconds())
+    val = (Decimal(diff_sec) / Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(val)
+
+
+def half_day_for(work_hours: Optional[float]) -> bool:
+    """Compute half-day status per Rule R5: rounded work_hours < 4.50."""
+    if work_hours is None:
+        return False
+    return Decimal(str(work_hours)) < HALF_DAY_THRESHOLD
+
+
+def r8(x: Any, places: int) -> Optional[float]:
+    """Format reported floating point values to given decimals using Decimal ROUND_HALF_UP (R8)."""
+    if x is None:
+        return None
+    pattern = Decimal("10") ** -places
+    return float(Decimal(str(x)).quantize(pattern, rounding=ROUND_HALF_UP))
+
+
+def derive(
+    status_val: str,
+    punch_in_utc: Optional[datetime],
+    punch_out_utc: Optional[datetime],
+    shift_start: str,
+    shift_end: str,
+    date_str: str,
+) -> dict:
+    """
+    Unified authoritative calculation of derived fields per DATA_MODEL status table:
+    (work_hours, late_minutes, overtime_minutes, half_day).
+    """
+    if status_val in PRESENCE_STATUSES:
+        if punch_out_utc is None:
+            work_hours = None
+            late_minutes = late_minutes_for(punch_in_utc, date_str, shift_start, shift_end) if punch_in_utc else 0
+            overtime_minutes = 0
+            half_day = False
+        else:
+            work_hours = work_hours_for(punch_in_utc, punch_out_utc)
+            late_minutes = late_minutes_for(punch_in_utc, date_str, shift_start, shift_end) if punch_in_utc else 0
+            overtime_minutes = overtime_for(punch_out_utc, date_str, shift_start, shift_end)
+            half_day = half_day_for(work_hours)
+    else:
+        work_hours = None
+        late_minutes = 0
+        overtime_minutes = 0
+        half_day = False
+    return {
+        "work_hours": work_hours,
+        "late_minutes": late_minutes,
+        "overtime_minutes": overtime_minutes,
+        "half_day": half_day,
+    }
+
+
+def parse_date_strict(val: str, loc: tuple) -> date:
+    """Strict calendar date parsing with regex check and year >= 1."""
+    if not isinstance(val, str) or not DATE_REGEX.match(val):
+        raise unprocessable(loc, "Invalid date format, expected YYYY-MM-DD")
+    try:
+        d = date.fromisoformat(val)
+        if d.year < 1:
+            raise ValueError
+        return d
+    except ValueError:
+        raise unprocessable(loc, "Invalid calendar date")
+
+
+def parse_month_strict(val: str, loc: tuple) -> tuple[int, int]:
+    """Strict calendar month parsing with regex check and year >= 1."""
+    if not isinstance(val, str) or not MONTH_REGEX.match(val):
+        raise unprocessable(loc, "Invalid month format, expected YYYY-MM")
+    y, m = map(int, val.split("-"))
+    if y < 1:
+        raise unprocessable(loc, "Invalid year")
+    return y, m
+
+
