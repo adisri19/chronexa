@@ -465,3 +465,63 @@ def punch_in(body: PunchInRequest):
 
     return serialize_record(doc)
 
+
+@app.post("/attendance/punch-out", tags=["attendance"])
+def punch_out(body: PunchOutRequest):
+    """Close employee's most recent open record with punch_in <= punched_at."""
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="employee not found")
+
+    out_dt = ms_to_dt(body.punched_at) if body.punched_at is not None else now_dt()
+
+    # Find most recent record with punch_in <= out_dt
+    rec = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$lte": out_dt, "$ne": None},
+        },
+        sort=[("punch_in", -1)],
+    )
+    if not rec:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no punch-in found")
+
+    # Ambiguity A1: if already closed, return 409 directly (do not fall back to older record)
+    if rec.get("punch_out") is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="record is already punched out")
+
+    # Ambiguity A2 / Rule R4: time validations
+    if out_dt <= rec["punch_in"]:
+        raise unprocessable(("body", "punched_at"), "punched_at must be strictly greater than punch_in")
+
+    if int((out_dt - rec["punch_in"]).total_seconds()) > MAX_PUNCH_SPAN_SECONDS:
+        raise unprocessable(("body", "punched_at"), "punched_at cannot be more than 24 hours after punch_in")
+
+    derived_vals = derive(
+        rec["status"],
+        rec["punch_in"],
+        out_dt,
+        emp["shift_start"],
+        emp["shift_end"],
+        rec["date"],
+    )
+
+    update_res = db.attendance_logs.update_one(
+        {"_id": rec["_id"], "punch_out": None},
+        {
+            "$set": {
+                "punch_out": out_dt,
+                "work_hours": derived_vals["work_hours"],
+                "late_minutes": derived_vals["late_minutes"],
+                "overtime_minutes": derived_vals["overtime_minutes"],
+                "half_day": derived_vals["half_day"],
+            }
+        },
+    )
+
+    if update_res.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="record was already closed concurrently")
+
+    updated = db.attendance_logs.find_one({"_id": rec["_id"]})
+    return serialize_record(updated)
+
