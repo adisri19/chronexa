@@ -814,7 +814,6 @@ def build_department_trend_pipeline(
     ]
 
 
-
 # --------------------------------------------------------------------------- #
 # 7. Lifespan & Index Creation
 # --------------------------------------------------------------------------- #
@@ -843,6 +842,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# --------------------------------------------------------------------------- #
+# 8. System Endpoints
+# --------------------------------------------------------------------------- #
+@app.get("/health", tags=["system"])
+def health():
+    """Readiness probe: returns 200 if MongoDB answers ping, 503 on any failure."""
+    try:
+        db.command("ping")
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database unavailable",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1331,3 +1346,174 @@ def department_trend(
         "items": items,
     }
 
+
+# --------------------------------------------------------------------------- #
+# 12. Admin / Explain Endpoint
+# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}", tags=["admin"])
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = Query(default=10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    from_str: Optional[str] = Query(None, alias="from"),
+    to_str: Optional[str] = Query(None, alias="to"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """
+    Execute explain with executionStats on the exact query or pipeline built by the named endpoint.
+    Guarantees query builders are strictly shared between production endpoints and explain.
+    """
+    if endpoint == "attendance_list":
+        if date_from is not None:
+            parse_date_strict(date_from, ("query", "date_from"))
+        if date_to is not None:
+            parse_date_strict(date_to, ("query", "date_to"))
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise unprocessable(("query", "date_from"), "date_from cannot be after date_to")
+        if status_filter is not None and status_filter not in ALL_STATUSES:
+            raise unprocessable(("query", "status"), f"status must be one of {ALL_STATUSES}")
+
+        q = build_attendance_list_query(emp_code, date_from, date_to, status_filter)
+        skip = (page - 1) * page_size
+        explain_cmd = {
+            "explain": {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": skip,
+                "limit": page_size,
+            },
+            "verbosity": "executionStats",
+        }
+        res = db.command(explain_cmd)
+        raw_json = json.loads(bson.json_util.dumps(res, json_options=bson.json_util.RELAXED_JSON_OPTIONS))
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": raw_json,
+        }
+
+    elif endpoint == "employee_monthly":
+        if not emp_code:
+            raise unprocessable(("query", "emp_code"), "emp_code is required for employee_monthly explain")
+        if not month:
+            raise unprocessable(("query", "month"), "month is required for employee_monthly explain")
+        y, m = parse_month_strict(month, ("query", "month"))
+        _, last_day = calendar.monthrange(y, m)
+        start_date = f"{y:04d}-{m:02d}-01"
+        end_date = f"{y:04d}-{m:02d}-{last_day:02d}"
+
+        pipeline = build_employee_monthly_pipeline(emp_code, start_date, end_date)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        res = db.command(explain_cmd)
+        raw_json = json.loads(bson.json_util.dumps(res, json_options=bson.json_util.RELAXED_JSON_OPTIONS))
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": raw_json,
+        }
+
+    elif endpoint == "department_summary":
+        if not month:
+            raise unprocessable(("query", "month"), "month is required for department_summary explain")
+        y, m = parse_month_strict(month, ("query", "month"))
+        _, last_day = calendar.monthrange(y, m)
+        start_date = f"{y:04d}-{m:02d}-01"
+        end_date = f"{y:04d}-{m:02d}-{last_day:02d}"
+
+        pipeline = build_department_summary_pipeline(start_date, end_date, department)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        res = db.command(explain_cmd)
+        raw_json = json.loads(bson.json_util.dumps(res, json_options=bson.json_util.RELAXED_JSON_OPTIONS))
+        return {
+            "endpoint": endpoint,
+            "collection": "employees",
+            "explain": raw_json,
+        }
+
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise unprocessable(("query", "month"), "month is required for late_leaderboard explain")
+        y, m = parse_month_strict(month, ("query", "month"))
+        _, last_day = calendar.monthrange(y, m)
+        start_date = f"{y:04d}-{m:02d}-01"
+        end_date = f"{y:04d}-{m:02d}-{last_day:02d}"
+
+        pipeline = build_late_leaderboard_pipeline(start_date, end_date, limit, department)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        res = db.command(explain_cmd)
+        raw_json = json.loads(bson.json_util.dumps(res, json_options=bson.json_util.RELAXED_JSON_OPTIONS))
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": raw_json,
+        }
+
+    elif endpoint == "department_trend":
+        dept = department or "Engineering"
+        if not from_str:
+            raise unprocessable(("query", "from"), "from is required for department_trend explain")
+        if not to_str:
+            raise unprocessable(("query", "to"), "to is required for department_trend explain")
+        from_d = parse_date_strict(from_str, ("query", "from"))
+        to_d = parse_date_strict(to_str, ("query", "to"))
+        if to_d < from_d:
+            raise unprocessable(("query", "to"), "to cannot be earlier than from")
+        num_days = (to_d - from_d).days + 1
+        if num_days > MAX_TREND_DAYS:
+            raise unprocessable(("query", "to"), "range exceeds 92 calendar days")
+
+        # Ambiguity A12: roster lookup for explain even if empty
+        roster = list(db.employees.find({"department": dept}, {"emp_code": 1, "joined_on": 1, "_id": 0}))
+        emp_codes = [e["emp_code"] for e in roster] if roster else ["EMP0001"]
+        joined_ons = [e["joined_on"] for e in roster] if roster else ["2026-01-01"]
+
+        pipeline = build_department_trend_pipeline(dept, from_str, num_days, emp_codes, joined_ons)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        res = db.command(explain_cmd)
+        raw_json = json.loads(bson.json_util.dumps(res, json_options=bson.json_util.RELAXED_JSON_OPTIONS))
+        return {
+            "endpoint": endpoint,
+            "collection": "employees",
+            "explain": raw_json,
+        }
