@@ -241,3 +241,109 @@ def parse_month_strict(val: str, loc: tuple) -> tuple[int, int]:
     return y, m
 
 
+# --------------------------------------------------------------------------- #
+# 4. Pydantic Models
+# --------------------------------------------------------------------------- #
+class EmployeeCreate(BaseModel):
+    emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(..., min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    joined_on: str
+
+    @model_validator(mode="after")
+    def validate_rules(self):
+        if not DATE_REGEX.match(self.joined_on):
+            raise ValueError("joined_on must match YYYY-MM-DD")
+        try:
+            d = date.fromisoformat(self.joined_on)
+            if d.year < 1:
+                raise ValueError
+        except ValueError:
+            raise ValueError("joined_on is not a valid calendar date")
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
+
+class PunchInRequest(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+class PunchOutRequest(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+
+
+class RegularizeRequest(BaseModel):
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[StrictInt] = Field(default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+    punch_out: Optional[StrictInt] = Field(default=None, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
+
+    @field_validator("status", "punch_in", "punch_out", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, v, info):
+        if v is None:
+            raise ValueError(f"{info.field_name} cannot be null")
+        return v
+
+
+# --------------------------------------------------------------------------- #
+# 5. Serialization
+# --------------------------------------------------------------------------- #
+def serialize_employee(doc: dict) -> dict:
+    """Format employee document strictly to schema: no _id, created_at as epoch ms."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": dt_to_ms(doc["created_at"]),
+    }
+
+
+def serialize_history_entry(entry: dict) -> dict:
+    """Format history entry: convert at and nested punch times from BSON datetime to epoch ms."""
+    changes_out = {}
+    for k, v in entry.get("changes", {}).items():
+        from_val = v.get("from")
+        to_val = v.get("to")
+        if k in ("punch_in", "punch_out"):
+            if isinstance(from_val, datetime):
+                from_val = dt_to_ms(from_val)
+            if isinstance(to_val, datetime):
+                to_val = dt_to_ms(to_val)
+        changes_out[k] = {"from": from_val, "to": to_val}
+    return {
+        "at": dt_to_ms(entry["at"]),
+        "by": entry["by"],
+        "reason": entry["reason"],
+        "changes": changes_out,
+    }
+
+
+def serialize_record(doc: dict) -> dict:
+    """Format attendance record: epoch ms instants, legacy defaults, no internal _id."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": dt_to_ms(doc["punch_in"]) if doc.get("punch_in") else None,
+        "punch_out": dt_to_ms(doc["punch_out"]) if doc.get("punch_out") else None,
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": [serialize_history_entry(h) for h in doc.get("history", [])],
+    }
+
+
