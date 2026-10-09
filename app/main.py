@@ -428,3 +428,40 @@ def list_employees(
     }
 
 
+# --------------------------------------------------------------------------- #
+# 10. Attendance Endpoints
+# --------------------------------------------------------------------------- #
+@app.post("/attendance/punch-in", status_code=status.HTTP_201_CREATED, tags=["attendance"])
+def punch_in(body: PunchInRequest):
+    """Record punch-in; creates day's attendance document; race-safe via (emp_code, date) unique index."""
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="employee not found")
+
+    in_dt = ms_to_dt(body.punched_at) if body.punched_at is not None else now_dt()
+    rec_date = attendance_date(in_dt, emp["shift_start"], emp["shift_end"])
+    derived_vals = derive(body.status, in_dt, None, emp["shift_start"], emp["shift_end"], rec_date)
+
+    doc = {
+        "emp_code": body.emp_code,
+        "date": rec_date,
+        "status": body.status,
+        "punch_in": in_dt,
+        "punch_out": None,
+        "work_hours": derived_vals["work_hours"],
+        "late_minutes": derived_vals["late_minutes"],
+        "overtime_minutes": derived_vals["overtime_minutes"],
+        "half_day": derived_vals["half_day"],
+        "history": [],
+    }
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="already punched in for this date",
+        )
+
+    return serialize_record(doc)
+
