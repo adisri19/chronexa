@@ -347,6 +347,29 @@ def serialize_record(doc: dict) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# 6. Query and Pipeline Builders (Shared with /admin/explain)
+# --------------------------------------------------------------------------- #
+def build_attendance_list_query(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status_filter: Optional[str] = None,
+) -> dict:
+    """Build find filter for attendance logs."""
+    q: dict = {}
+    if emp_code:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from
+        if date_to:
+            q["date"]["$lte"] = date_to
+    if status_filter:
+        q["status"] = status_filter
+    return q
+
 
 
 # --------------------------------------------------------------------------- #
@@ -523,5 +546,169 @@ def punch_out(body: PunchOutRequest):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="record was already closed concurrently")
 
     updated = db.attendance_logs.find_one({"_id": rec["_id"]})
+    return serialize_record(updated)
+
+
+@app.get("/attendance", tags=["attendance"])
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List attendance records with database-side sorting and pagination."""
+    if date_from is not None:
+        parse_date_strict(date_from, ("query", "date_from"))
+    if date_to is not None:
+        parse_date_strict(date_to, ("query", "date_to"))
+    if date_from is not None and date_to is not None:
+        if date_from > date_to:
+            raise unprocessable(("query", "date_from"), "date_from cannot be after date_to")
+
+    if status_filter is not None and status_filter not in ALL_STATUSES:
+        raise unprocessable(("query", "status"), f"status must be one of {ALL_STATUSES}")
+
+    q = build_attendance_list_query(emp_code, date_from, date_to, status_filter)
+    total = db.attendance_logs.count_documents(q)
+    skip = (page - 1) * page_size
+    cursor = db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size)
+    items = [serialize_record(d) for d in cursor]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.patch("/attendance/{emp_code}/{date}", tags=["attendance"])
+def regularize_attendance(
+    emp_code: str,
+    date: str,
+    body: RegularizeRequest,
+):
+    """Regularize an attendance record: recompute derived fields and append to history audit trail."""
+    parse_date_strict(date, ("path", "date"))
+
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="employee not found")
+
+    old_rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not old_rec:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="attendance record not found")
+
+    new_status = body.status if body.status is not None else old_rec["status"]
+
+    if new_status in (STATUS_ABSENT, STATUS_LEAVE):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise unprocessable(
+                ("body", "punch_in"),
+                f"punch_in and punch_out cannot be supplied for {new_status} status",
+            )
+        new_in = None
+        new_out = None
+    else:
+        new_in = ms_to_dt(body.punch_in) if body.punch_in is not None else old_rec.get("punch_in")
+        if new_in is None:
+            raise unprocessable(("body", "punch_in"), f"punch_in is required for status {new_status}")
+
+        if attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise unprocessable(("body", "punch_in"), "punch_in does not fall on the record's attendance date")
+
+        new_out = ms_to_dt(body.punch_out) if body.punch_out is not None else old_rec.get("punch_out")
+        if new_out is not None:
+            if new_out <= new_in:
+                raise unprocessable(("body", "punch_out"), "punch_out must be strictly greater than punch_in")
+            if int((new_out - new_in).total_seconds()) > MAX_PUNCH_SPAN_SECONDS:
+                raise unprocessable(("body", "punch_out"), "punch_out cannot be more than 24 hours after punch_in")
+
+    derived_vals = derive(
+        new_status,
+        new_in,
+        new_out,
+        emp["shift_start"],
+        emp["shift_end"],
+        date,
+    )
+
+    # Compare with legacy defaults
+    old_status = old_rec["status"]
+    old_in = old_rec.get("punch_in")
+    old_out = old_rec.get("punch_out")
+    old_wh = old_rec.get("work_hours")
+    old_late = old_rec.get("late_minutes", 0)
+    old_ot = old_rec.get("overtime_minutes", 0)
+    old_half = old_rec.get("half_day", False)
+
+    new_wh = derived_vals["work_hours"]
+    new_late = derived_vals["late_minutes"]
+    new_ot = derived_vals["overtime_minutes"]
+    new_half = derived_vals["half_day"]
+
+    changes: dict = {}
+    if old_status != new_status:
+        changes["status"] = {"from": old_status, "to": new_status}
+    if old_in != new_in:
+        changes["punch_in"] = {"from": old_in, "to": new_in}
+    if old_out != new_out:
+        changes["punch_out"] = {"from": old_out, "to": new_out}
+    if old_wh != new_wh:
+        changes["work_hours"] = {"from": old_wh, "to": new_wh}
+    if old_late != new_late:
+        changes["late_minutes"] = {"from": old_late, "to": new_late}
+    if old_ot != new_ot:
+        changes["overtime_minutes"] = {"from": old_ot, "to": new_ot}
+    if old_half != new_half:
+        changes["half_day"] = {"from": old_half, "to": new_half}
+
+    # Ambiguity A3: request that changes nothing is 422
+    if not changes:
+        raise unprocessable(("body",), "request changes nothing")
+
+    hist_entry = {
+        "at": now_dt(),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    set_doc = {
+        "status": new_status,
+        "punch_in": new_in,
+        "punch_out": new_out,
+        "work_hours": new_wh,
+        "late_minutes": new_late,
+        "overtime_minutes": new_ot,
+        "half_day": new_half,
+    }
+
+    # Optimistic locking pin (concurrency guard)
+    filter_q: dict = {
+        "_id": old_rec["_id"],
+        "status": old_status,
+        "punch_in": old_in,
+        "punch_out": old_out,
+    }
+    if old_rec.get("history") is not None:
+        filter_q["history"] = {"$size": len(old_rec["history"])}
+    else:
+        filter_q["history"] = {"$exists": False}
+
+    update_res = db.attendance_logs.update_one(
+        filter_q,
+        {
+            "$set": set_doc,
+            "$push": {"history": hist_entry},
+        },
+    )
+
+    if update_res.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="concurrent update conflict")
+
+    updated = db.attendance_logs.find_one({"_id": old_rec["_id"]})
     return serialize_record(updated)
 
