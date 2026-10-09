@@ -347,3 +347,33 @@ def serialize_record(doc: dict) -> dict:
     }
 
 
+
+
+# --------------------------------------------------------------------------- #
+# 7. Lifespan & Index Creation
+# --------------------------------------------------------------------------- #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create indexes at application startup idempotently without failing startup on errors."""
+    try:
+        db.employees.create_index([("emp_code", 1)], unique=True)
+        db.employees.create_index([("department", 1), ("emp_code", 1)])
+        db.employees.create_index([("department", 1), ("joined_on", 1)])
+        db.employees.create_index([("joined_on", 1)])
+
+        db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+        db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+        db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)])
+        db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+        logger.info("MongoDB indexes verified / created successfully.")
+    except Exception as e:
+        logger.error(f"Non-fatal error creating indexes: {e}")
+    yield
+
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
